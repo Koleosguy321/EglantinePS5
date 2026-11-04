@@ -46,8 +46,7 @@ prepare: deps ## Build cache, Eden source, FFmpeg, packaging tool, driver stub, 
 	bash tools/prepare-build.sh
 
 deps: ## Fetch missing dependencies at their pinned revisions (and the Eglantine submodule)
-	@# Only when the submodule is empty: tools/apply-eglantine-patches.sh moves it to a newer commit.
-	@[ -f Eglantine/CMakeLists.txt ] || git submodule update --init Eglantine
+	git submodule update --init Eglantine
 	$(PYTHON) tools/deps.py fetch
 	bash tools/apply-eglantine-patches.sh
 

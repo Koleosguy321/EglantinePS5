@@ -1,0 +1,258 @@
+From 0789b0b2cb8545714a9456380172cff36a0c1c45 Mon Sep 17 00:00:00 2001
+From: Aidan Kinzett <aidan@kinzett.io>
+Date: Tue, 3 Nov 2026 22:01:30 +1000
+Subject: [PATCH 3/7] Fix geometry shaders refused
+
+Signed-off-by: Aidan Kinzett <aidan@kinzett.io>
+---
+ .../backend/spirv/emit_spirv_special.cpp      | 10 +++-
+ .../frontend/ampere/lower_to_maxwell.h        | 52 ++++++++++++++++++-
+ src/shader_recompiler/frontend/ir/attribute.h |  2 +-
+ src/tests/CMakeLists.txt                      |  1 +
+ src/tests/video_core/ampere_geometry.cpp      | 46 ++++++++++++++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 11 ++++
+ src/video_core/shader_environment.cpp         |  6 ++-
+ src/video_core/vulkan_common/vulkan_device.h  |  5 ++
+ 8 files changed, 127 insertions(+), 6 deletions(-)
+ create mode 100644 src/tests/video_core/ampere_geometry.cpp
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+index 8eca1fac29..acd2c417cb 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+@@ -153,7 +153,10 @@ void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
+     if (ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc) {
+         ConvertDepthMode(ctx);
+     }
+-    if (!ctx.profile.support_geometry_streams) {
++    // Stream 0 is the plain EmitVertex, which needs no GeometryStreams capability.
++    if (stream.IsImmediate() && stream.U32() == 0) {
++        ctx.OpEmitVertex();
++    } else if (!ctx.profile.support_geometry_streams) {
+         throw NotImplementedException("Geometry streams");
+     } else if (stream.IsImmediate()) {
+         ctx.OpEmitStreamVertex(ctx.Def(stream));
+@@ -166,7 +169,10 @@ void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
+ }
+ 
+ void EmitEndPrimitive(EmitContext& ctx, const IR::Value& stream) {
+-    if (!ctx.profile.support_geometry_streams) {
++    // Stream 0 is the plain EndPrimitive, which needs no GeometryStreams capability.
++    if (stream.IsImmediate() && stream.U32() == 0) {
++        ctx.OpEndPrimitive();
++    } else if (!ctx.profile.support_geometry_streams) {
+         throw NotImplementedException("Geometry streams");
+     } else if (stream.IsImmediate()) {
+         ctx.OpEndStreamPrimitive(ctx.Def(stream));
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 031f7fac75..3a4fb27b8b 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -43,7 +43,7 @@ struct LoweredProgram {
+ // Lower only operations whose semantics are representable by the existing
+ // Maxwell frontend. These are new instructions, not reinterpretations of the
+ // native bytes. Scheduling/control words are added by the environment adapter.
+-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
++inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry = false) {
+     LoweredProgram result;
+     struct Relocation { u32 output_index; s64 target; };
+     std::vector<Relocation> relocations;
+@@ -2214,6 +2214,56 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
+                 return finish(index); // the closing self-branch
+             break;
+         }
++        case 0x324: case 0x924: { // OUT: geometry output (register or immediate stream).
++            if (!geometry) return fail(index, "unsupported native opcode");
++            // Ampere: Rd 16-23 (the new output handle), Ra 24-31 (the old one), the stream in Rb
++            // 32-39 or the immediate 32-63; 78-79 emit (1), cut (2) or both, 0 is OUTFINAL.
++            // Maxwell OUT: Rd 0-7, Ra 8-15, stream Rb 20-27 or imm20 20-38, emit 39, cut 40. The
++            // host keeps no output handle, so OUTFINAL only passes the handle through.
++            const u32 type = insn.Bits(78, 2);
++            if (insn.Bits(80, 12) || insn.Bits(64, 14)) return fail(index, "native OUT mode");
++            const u32 a = insn.Bits(24, 8);
++            if (type == 0) {
++                if (dest != 255) emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{a} << 20));
++                break;
++            }
++            if (opcode == 0x324) {
++                emit(base(0xfbe0000000000000ULL) | (u64{a} << 8) | (u64{insn.Bits(32, 8)} << 20) |
++                     (u64{type} << 39));
++            } else {
++                if (insn.words[1] >= (1U << 19)) return fail(index, "native OUT stream immediate");
++                emit(base(0xf6e0000000000000ULL) | (u64{a} << 8) | (u64{insn.words[1]} << 20) |
++                     (u64{type} << 39));
++            }
++            break;
++        }
++        case 0x34e: { // LEPC Rd: the instruction's own address (64-bit, in Rd and Rd + 1).
++            // In geometry shaders it sets up an exit stub with 0x357; per thread nothing reads it.
++            if (!geometry) return fail(index, "unsupported native opcode");
++            if (insn.words[1] || insn.words[2]) return fail(index, "native LEPC mode");
++            if (dest != 255) {
++                emit(base(0x0100000000000000ULL) | (u64{15} << 12) | (u64{index * 16} << 20));
++                if (dest + 1 < 255) {
++                    emit(0x0100000000000000ULL | predicate | (dest + 1) | (u64{15} << 12));
++                }
++            }
++            break;
++        }
++        case 0x357: case 0x957: // Geometry exit stub: install (0x357) and finish (0x957) it.
++            // Per thread, with no output to finish, EXIT just ends the invocation.
++            if (!geometry) return fail(index, "unsupported native opcode");
++            emit(0x50b0000000000f00ULL | predicate);
++            break;
++        case 0x923: { // ISBERD in a geometry program: a vertex's stage buffer entry, which only
++            // ALD reads: Ra passes through, as Maxwell's ISBERD does.
++            if (!geometry) return fail(index, "unsupported native opcode");
++            if (insn.Bits(75, 5) || insn.Bits(40, 24))
++                return fail(index, "native geometry ISBERD mode");
++            if (dest != 255) {
++                emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{insn.Bits(24, 8)} << 20));
++            }
++            break;
++        }
+         case 0x94d: { // EXIT
+             if (insn.Bits(84, 2)) {
+                 return fail(index, "native conditional/special EXIT");
+diff --git a/src/shader_recompiler/frontend/ir/attribute.h b/src/shader_recompiler/frontend/ir/attribute.h
+index 4adf980949..7fc67bdf22 100644
+--- a/src/shader_recompiler/frontend/ir/attribute.h
++++ b/src/shader_recompiler/frontend/ir/attribute.h
+@@ -237,7 +237,7 @@ constexpr size_t NUM_GENERICS = 32;
+ constexpr size_t NUM_FIXEDFNCTEXTURE = 10;
+ 
+ [[nodiscard]] inline bool IsGeneric(Attribute attribute) noexcept {
+-    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31X;
++    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31W;
+ }
+ 
+ [[nodiscard]] inline bool IsLegacyAttribute(Attribute attribute) noexcept {
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index dd6f5d97b5..cb9f9aa2f8 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -19,6 +19,7 @@ add_executable(tests
+     core/core_timing.cpp
+     core/internal_network/network.cpp
+     video_core/memory_tracker.cpp
++    video_core/ampere_geometry.cpp
+     video_core/ampere_returns.cpp
+     input_common/calibration_configuration_job.cpp
+ )
+diff --git a/src/tests/video_core/ampere_geometry.cpp b/src/tests/video_core/ampere_geometry.cpp
+new file mode 100644
+index 0000000000..d48aac4b17
+--- /dev/null
++++ b/src/tests/video_core/ampere_geometry.cpp
+@@ -0,0 +1,46 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <catch2/catch_test_macros.hpp>
++
++#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++
++namespace {
++using Shader::Ampere::Instruction;
++using Shader::Ampere::LowerToMaxwell;
++
++constexpr Instruction EXIT{{0x0000794d, 0, 0x03800000, 0}};
++
++bool Contains(const Shader::Ampere::LoweredProgram& lowered, u64 instruction) {
++    return std::find(lowered.instructions.begin(), lowered.instructions.end(), instruction) !=
++           lowered.instructions.end();
++}
++
++constexpr std::array<Instruction, 5> GEOMETRY_PROGRAM{{
++    {{0x0004734e, 0, 0, 0}},          // LEPC R4
++    {{0x00017923, 0, 0, 0}},          // ISBERD R1, [R0]
++    {{0x00027324, 0xff, 0x4000, 0}},  // OUT.EMIT R2, R0, RZ
++    {{0x02037924, 0, 0x8000, 0}},     // OUT.CUT R3, R2, 0
++    EXIT,
++}};
++
++TEST_CASE("Ampere geometry programs lower their output instructions", "[video_core][ampere]") {
++    const auto lowered = LowerToMaxwell(GEOMETRY_PROGRAM, true);
++    REQUIRE(static_cast<bool>(lowered));
++    REQUIRE(Contains(lowered, 0x010000000007f004ULL)); // MOV32I R4, 0 (its own address)
++    REQUIRE(Contains(lowered, 0x010000000007f005ULL)); // MOV32I R5, 0
++    REQUIRE(Contains(lowered, 0x5c98078000070001ULL)); // MOV R1, R0
++    REQUIRE(Contains(lowered, 0xfbe000800ff70002ULL)); // OUT.EMIT R2, R0, RZ
++    REQUIRE(Contains(lowered, 0xf6e0010000070203ULL)); // OUT.CUT R3, R2, 0
++}
++
++TEST_CASE("Ampere output instructions stay rejected outside geometry programs",
++          "[video_core][ampere]") {
++    const auto lowered = LowerToMaxwell(GEOMETRY_PROGRAM);
++    REQUIRE(!static_cast<bool>(lowered));
++    REQUIRE(lowered.error == "unsupported native opcode");
++}
++
++} // namespace
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 2c64f3375b..8160604fa7 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -888,6 +888,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         if (key.unique_hashes[index] == 0) {
+             continue;
+         }
++        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
++            !device.IsGeometryShaderSupported() && maxwell3d != nullptr &&
++            maxwell3d->GetNativeMacroEngine().native_turing) {
++            // A native (Switch 2) geometry program on a device without geometry shaders: the
++            // pipeline cannot run it, so its draws are skipped.
++            static std::atomic<bool> logged{};
++            if (!logged.exchange(true)) {
++                LOG_WARNING(Render_Vulkan, "Skipping native geometry shader pipelines: the device has no geometry shaders");
++            }
++            return nullptr;
++        }
+         Shader::Environment& env{*envs[env_index]};
+         ++env_index;
+ 
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 9d189ad4f0..14d038e37c 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -354,7 +354,8 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
+         }
+         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
+     }
+-    auto lowered = Shader::Ampere::LowerToMaxwell(native);
++    // SPH shader type 4 is a geometry program (compute programs have no SPH).
++    auto lowered = Shader::Ampere::LowerToMaxwell(native, sph.common0.shader_type == 4);
+     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
+     // lowered program changes a game's behaviour without rebuilding).
+     if (static const std::string reject_list = [] {
+@@ -471,7 +472,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
+     initial_offset = sizeof(sph);
+     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
+     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
++        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
++            program != Maxwell::ShaderType::Geometry) {
+             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
+         }
+         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index d8524f6575..d463d26cee 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -393,6 +393,11 @@ FN_MAX_LIMIT_LIST
+         return is_optimal_astc_supported;
+     }
+ 
++    /// Returns true if geometry shaders are supported.
++    bool IsGeometryShaderSupported() const {
++        return features.features.geometryShader;
++    }
++
+     /// Returns true if BCn is natively supported.
+     bool IsOptimalBcnSupported() const {
+         return features.features.textureCompressionBC;
+-- 
+2.43.0
+
