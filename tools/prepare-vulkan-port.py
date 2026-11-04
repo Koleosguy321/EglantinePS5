@@ -133,15 +133,21 @@ void RasterizerVulkan::DispatchCompute() {"""),
     ::Eden::Performance::Mark(::Eden::Performance::draw_pipeline, phase);
 '''),
     ('''    pipeline->SetEngine(maxwell3d, gpu_memory);
+    const u32 repack_dirty = ''',
+     '''    pipeline->SetEngine(maxwell3d, gpu_memory);
+    // Waiting for both cache mutexes. SetEngine between them and here is two pointer assignments,
+    // and the hold itself carries on through what follows: the phases below measure it.
+    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);
+    const u32 repack_dirty = '''),
+    ('''        }
+    }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         return;
     }
 ''',
-     '''    pipeline->SetEngine(maxwell3d, gpu_memory);
-    // Waiting for both cache mutexes. SetEngine between them and here is two pointer assignments,
-    // and the hold itself carries on through what follows: the phases below measure it.
-    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);
+     '''        }
+    }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         return;
@@ -899,7 +905,8 @@ gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
     };
 ''' + (port / 'vulkan_gc_downloads.inc').read_text()
 for old, new in [
-    ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode]',
+    ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,\n'
+     '                          &evict_old_costly]',
      gc_setup + '\n    const auto Cleanup = [&, this]'),
     ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
     # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
@@ -1078,8 +1085,10 @@ shader_costs = [
      '#include "performance.h"\n#include "dev_vulkan.h"\n#include "diagnostics.h"'),
     # Development crash probes: report each pipeline's first use (stage hashes) to klog,
     # which survives a GPU fault that kills the title.
-    ('    current_pipeline = pipeline.get();\n    return BuiltPipeline(current_pipeline);\n}',
+    ('    current_pipeline = pipeline.get();\n    current_pipeline->MarkUsed(frame_count);\n'
+     '    return BuiltPipeline(current_pipeline);\n}',
      '    current_pipeline = pipeline.get();\n'
+     '    current_pipeline->MarkUsed(frame_count);\n'
      '    if (::Eden::DevVulkan::trace_pipelines) {\n'
      '        static std::unordered_set<const void*> traced;\n'
      '        if (traced.insert(current_pipeline).second) {\n'
@@ -1117,13 +1126,14 @@ shader_costs = [
      '    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
     ('                                                 u32 cache_version) try {',
      '                                                 u32 cache_version) try {\n    auto timer = Eden::Performance::VulkanTimer(18);'),
-    ('}\n\nPipelineCache::~PipelineCache()',
+    ('        device.SupportsTransformFeedbackProvokingVertexPreservation();\n}\n',
+     '        device.SupportsTransformFeedbackProvokingVertexPreservation();\n'
      '    if (Eden::Performance::vulkan_cost_enabled.load(std::memory_order_relaxed))\n'
      '        std::printf("EDEN_VULKAN_DYNAMIC blend=%u enables=%u vertex=%u\\n",\n'
      '                    unsigned(dynamic_features.has_extended_dynamic_state_3_blend),\n'
      '                    unsigned(dynamic_features.has_extended_dynamic_state_3_enables),\n'
      '                    unsigned(dynamic_features.has_dynamic_vertex_input));\n'
-     '}\n\nPipelineCache::~PipelineCache()'),
+     '}\n'),
 ]
 # Time both graphics and compute preparation, without modifying the compiler or
 # reading guest state on another thread. These intervals overlap shader_prepare.
